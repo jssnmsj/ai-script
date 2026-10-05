@@ -2,6 +2,9 @@ import asyncio
 import discord
 from discord.ext import commands
 import random
+import json
+import os
+from datetime import datetime, timedelta
 
 # Configure intents
 intents = discord.Intents.default()
@@ -10,7 +13,10 @@ intents.dm_messages = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-bot.remove_command("help")  # Important: removes default help so our custom one works
+bot.remove_command("help")
+
+# File to save data
+DATA_FILE = "bot_data.json"
 
 # Trackers
 active_spams = {}
@@ -18,13 +24,59 @@ spam_messages = {}
 user_message_counts = {}
 user_balances = {}
 user_multipliers = {}
+user_daily = {}  # {user_id: {"last_claim": "ISO date", "streak": int}}
 
 # Constants
-CHAT_MULTIPLIER_LEVEL_1_COST = 1_000_000_000      # 1B
+CHAT_MULTIPLIER_LEVEL_1_COST = 1_000_000_000
 CHAT_MULTIPLIER_LEVEL_1_VALUE = 5
-COINFLIP_MAX = 2_500_000                          # 2.5M
-RISK_MAX = 5_000_000                              # 5M
-GIVE_MAX = 999 * 10**15                           # 999Qd
+COINFLIP_MAX = 2_500_000
+RISK_MAX = 5_000_000
+GIVE_MAX = 999 * 10**15
+
+DAILY_BASE = 2000
+DAILY_STREAK_BONUS = 1000
+DAILY_100_STREAK_REWARD = 500_000_000  # 500M
+
+# ──────────────────────────────────────────────
+# Admin Check
+# ──────────────────────────────────────────────
+def is_admin(member: discord.Member) -> bool:
+    """Check if the user has a role named 'admin' (case insensitive)"""
+    return any(role.name.lower() == "admin" for role in member.roles)
+
+
+# ──────────────────────────────────────────────
+# Save / Load System
+# ──────────────────────────────────────────────
+def save_data():
+    data = {
+        "balances": {str(k): v for k, v in user_balances.items()},
+        "multipliers": {str(k): v for k, v in user_multipliers.items()},
+        "message_counts": {str(k): v for k, v in user_message_counts.items()},
+        "daily": {str(k): v for k, v in user_daily.items()}
+    }
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+
+def load_data():
+    global user_balances, user_multipliers, user_message_counts, user_daily
+
+    if not os.path.exists(DATA_FILE):
+        return
+
+    try:
+        with open(DATA_FILE, "r") as f:
+            data = json.load(f)
+
+        user_balances = {int(k): v for k, v in data.get("balances", {}).items()}
+        user_multipliers = {int(k): v for k, v in data.get("multipliers", {}).items()}
+        user_message_counts = {int(k): v for k, v in data.get("message_counts", {}).items()}
+        user_daily = {int(k): v for k, v in data.get("daily", {}).items()}
+        print("✅ Data loaded successfully!")
+    except Exception as e:
+        print(f"Failed to load data: {e}")
+
 
 # ──────────────────────────────────────────────
 # Number helpers
@@ -75,6 +127,7 @@ def get_balance(user_id: int) -> int:
 
 def add_balance(user_id: int, amount: int):
     user_balances[user_id] = get_balance(user_id) + amount
+    save_data()
 
 
 # ──────────────────────────────────────────────
@@ -82,6 +135,7 @@ def add_balance(user_id: int, amount: int):
 # ──────────────────────────────────────────────
 @bot.event
 async def on_ready():
+    load_data()
     print(f"Logged in as {bot.user}")
 
 
@@ -93,6 +147,7 @@ async def on_message(message):
     user_id = message.author.id
     multiplier = user_multipliers.get(user_id, 1)
     user_message_counts[user_id] = user_message_counts.get(user_id, 0) + multiplier
+    save_data()
 
     await bot.process_commands(message)
 
@@ -114,14 +169,15 @@ async def help_command(ctx):
             "`!chat [message]` → Make the bot say something\n"
             "`!spam <amount> <message>` → Spam a message (1-150)\n"
             "`!change <new message>` → Change current spam message\n"
-            "`!stop` → Stop any active spam"
+            "`!stop` → Stop any active spam\n"
+            "`!updlog` → View update log"
         ),
         inline=False
     )
 
     embed.add_field(
         name="🏆 Leaderboard",
-        value="`!leaderboard` / `!lb` → Top 10 message leaderboard (auto-updates)",
+        value="`!leaderboard` / `!lb` → Top 10 message leaderboard (auto-updates every 3s)",
         inline=False
     )
 
@@ -129,7 +185,8 @@ async def help_command(ctx):
         name="💰 Economy",
         value=(
             "`!balance` / `!bal` [@user] → Check balance\n"
-            "`!give @user <amount>` → Transfer money to someone\n"
+            "`!give @user <amount>` → Transfer money\n"
+            "`!daily` → Claim daily reward (streak system)\n"
             "`!upgrade chat_multiplier 1` → Upgrade chat multiplier (costs 1B)"
         ),
         inline=False
@@ -145,12 +202,83 @@ async def help_command(ctx):
     )
 
     embed.add_field(
-        name="📌 Notes",
-        value="Amounts support: `K` `M` `B` `T` `Qd`\nExample: `!cf 1.5M` or `!give @user 500k`",
+        name="🛡️ Admin Only",
+        value=(
+            "`!addmoney @user <amount>` → Give unlimited money\n"
+            "`!give` (as admin) → Can give any amount without limits"
+        ),
         inline=False
     )
 
-    embed.set_footer(text="Use !help anytime")
+    embed.add_field(
+        name="📌 Notes",
+        value="Amounts support: `K` `M` `B` `T` `Qd`\nRole name must be exactly **admin**",
+        inline=False
+    )
+
+    embed.set_footer(text="Data is auto-saved • Use !help anytime")
+    await ctx.send(embed=embed)
+
+
+# ──────────────────────────────────────────────
+# Update Log
+# ──────────────────────────────────────────────
+@bot.command(name="updlog")
+async def updlog(ctx):
+    embed = discord.Embed(
+        title="📜 Update Log",
+        description="Recent changes and improvements:",
+        color=discord.Color.purple()
+    )
+
+    embed.add_field(
+        name="🆕 Latest Update",
+        value=(
+            "• Added `!updlog` command\n"
+            "• Leaderboard now updates every **3 seconds**\n"
+            "• All money amounts now show with suffixes (K, M, B, T, Qd)\n"
+            "• Fixed abuse bugs on give & admin commands\n"
+            "• Added full Admin system (role: `admin`)"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="💰 Economy Updates",
+        value=(
+            "• Added `!daily` with streak system\n"
+            "• Base daily: **$2,000** + **$1,000** per streak\n"
+            "• **100 streak** reward: **$500,000,000**\n"
+            "• Added `!addmoney` (Admin only)\n"
+            "• `!give` now properly transfers money\n"
+            "• Admins can give unlimited amounts"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="💾 System Updates",
+        value=(
+            "• Added **auto-save** system (data survives offline)\n"
+            "• Saves balances, multipliers, message counts & daily streaks\n"
+            "• Fixed help command conflict\n"
+            "• Improved error messages across all commands"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🎲 Other",
+        value=(
+            "• Coinflip + Risk coinflip\n"
+            "• Chat Multiplier upgrade\n"
+            "• Live leaderboard\n"
+            "• Spam system with change/stop"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text="Thanks for using the bot!")
     await ctx.send(embed=embed)
 
 
@@ -222,7 +350,7 @@ def build_leaderboard_embed():
 
     for rank, (user_id, count) in enumerate(sorted_users, 1):
         prefix = medals[rank - 1] if rank <= 3 else f"**#{rank}**"
-        text += f"{prefix} <@{user_id}> — **{count:,}** messages\n"
+        text += f"{prefix} <@{user_id}> — **{format_amount(count)}** messages\n"
 
     embed.description = text
     embed.set_footer(text="Updates every 3 seconds")
@@ -275,6 +403,7 @@ async def upgrade(ctx, feature: str, level: int):
 
     add_balance(user_id, -cost)
     user_multipliers[user_id] = CHAT_MULTIPLIER_LEVEL_1_VALUE
+    save_data()
 
     await ctx.send(
         f"✅ **Chat Multiplier upgraded to ×{CHAT_MULTIPLIER_LEVEL_1_VALUE}!**\n"
@@ -288,6 +417,7 @@ async def balance(ctx, member: discord.Member = None):
     target = member or ctx.author
     bal = get_balance(target.id)
     mult = user_multipliers.get(target.id, 1)
+    daily_info = user_daily.get(target.id, {"streak": 0})
 
     embed = discord.Embed(
         title=f"💰 {target.display_name}'s Balance",
@@ -295,13 +425,14 @@ async def balance(ctx, member: discord.Member = None):
     )
     embed.add_field(name="Cash", value=f"**{format_amount(bal)}**", inline=True)
     embed.add_field(name="Chat Multiplier", value=f"**×{mult}**", inline=True)
+    embed.add_field(name="Daily Streak", value=f"**{daily_info.get('streak', 0)}** days", inline=True)
     await ctx.send(embed=embed)
 
 
 @bot.command(name="give")
 async def give(ctx, member: discord.Member, amount: str):
-    """Transfer money to another user"""
-    if member.id == ctx.author.id:
+    """Transfer money. Admins can give unlimited amounts."""
+    if member.id == ctx.author.id and not is_admin(ctx.author):
         await ctx.send("You can't give money to yourself.")
         return
 
@@ -315,6 +446,17 @@ async def give(ctx, member: discord.Member, amount: str):
         await ctx.send("Amount must be positive.")
         return
 
+    # Admin can give any amount (no limits)
+    if is_admin(ctx.author):
+        add_balance(member.id, value)
+        await ctx.send(
+            f"🛡️ **Admin Give**\n"
+            f"✅ Gave **{format_amount(value)}** to {member.mention}\n"
+            f"Their new balance: **{format_amount(get_balance(member.id))}**"
+        )
+        return
+
+    # Normal user limits
     if value > GIVE_MAX:
         await ctx.send(f"Maximum you can give is **{format_amount(GIVE_MAX)}**.")
         return
@@ -324,7 +466,6 @@ async def give(ctx, member: discord.Member, amount: str):
         await ctx.send(f"You only have **{format_amount(giver_bal)}**.")
         return
 
-    # Transfer
     add_balance(ctx.author.id, -value)
     add_balance(member.id, value)
 
@@ -332,6 +473,90 @@ async def give(ctx, member: discord.Member, amount: str):
         f"✅ {ctx.author.mention} gave **{format_amount(value)}** to {member.mention}\n"
         f"Your new balance: **{format_amount(get_balance(ctx.author.id))}**"
     )
+
+
+@bot.command(name="addmoney")
+async def addmoney(ctx, member: discord.Member, amount: str):
+    """Admin only: Give unlimited money to anyone (including yourself)"""
+    if not is_admin(ctx.author):
+        await ctx.send("❌ You need the **admin** role to use this command.")
+        return
+
+    try:
+        value = parse_amount(amount)
+    except ValueError:
+        await ctx.send("Invalid amount. Use numbers like `1000`, `2.5M`, `1B`, `500k`, `10Qd`")
+        return
+
+    if value <= 0:
+        await ctx.send("Amount must be positive.")
+        return
+
+    add_balance(member.id, value)
+
+    await ctx.send(
+        f"🛡️ **Admin Add Money**\n"
+        f"✅ Added **{format_amount(value)}** to {member.mention}\n"
+        f"New balance: **{format_amount(get_balance(member.id))}**"
+    )
+
+
+@bot.command(name="daily")
+async def daily(ctx):
+    """Claim your daily reward. Streak increases reward."""
+    user_id = ctx.author.id
+    now = datetime.utcnow()
+
+    data = user_daily.get(user_id, {"last_claim": None, "streak": 0})
+    last_claim_str = data.get("last_claim")
+    streak = data.get("streak", 0)
+
+    if last_claim_str:
+        last_claim = datetime.fromisoformat(last_claim_str)
+        time_diff = now - last_claim
+
+        if time_diff < timedelta(hours=24):
+            remaining = timedelta(hours=24) - time_diff
+            hours, remainder = divmod(int(remaining.total_seconds()), 3600)
+            minutes = remainder // 60
+            await ctx.send(f"⏳ You can claim again in **{hours}h {minutes}m**.")
+            return
+
+        if time_diff < timedelta(hours=48):
+            streak += 1
+        else:
+            streak = 1
+    else:
+        streak = 1
+
+    reward = DAILY_BASE + (streak * DAILY_STREAK_BONUS)
+
+    bonus_text = ""
+    if streak == 100:
+        reward += DAILY_100_STREAK_REWARD
+        bonus_text = f"\n\n🎉 **100 STREAK BONUS!** +{format_amount(DAILY_100_STREAK_REWARD)}"
+
+    add_balance(user_id, reward)
+
+    user_daily[user_id] = {
+        "last_claim": now.isoformat(),
+        "streak": streak
+    }
+    save_data()
+
+    embed = discord.Embed(
+        title="📅 Daily Reward Claimed!",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Streak", value=f"**{streak}** days", inline=True)
+    embed.add_field(name="Reward", value=f"**{format_amount(reward)}**", inline=True)
+    embed.add_field(name="New Balance", value=f"**{format_amount(get_balance(user_id))}**", inline=False)
+
+    if bonus_text:
+        embed.description = bonus_text
+
+    embed.set_footer(text="Come back tomorrow to continue your streak!")
+    await ctx.send(embed=embed)
 
 
 # ──────────────────────────────────────────────
@@ -377,10 +602,8 @@ async def coinflip(ctx, *args):
         await ctx.send(f"You only have **{format_amount(bal)}**.")
         return
 
-    # Deduct bet
     add_balance(user_id, -amount)
 
-    # Flip
     if is_risk:
         win = random.random() < 0.30
         mode_name = "Risk Coinflip (30% win)"
